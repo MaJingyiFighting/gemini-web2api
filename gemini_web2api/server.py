@@ -8,7 +8,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, write_debug_log
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import upload_image, fetch_image_bytes
 from . import __version__
@@ -112,6 +112,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
+            
+            self.req_id = f"req_{uuid.uuid4().hex[:8]}"
+            if CONFIG.get("debug_log_client_body"):
+                write_debug_log({"req_id": self.req_id, "path": self.path}, client_body_raw=body.decode("utf-8", errors="replace"))
+                
             if self.path == "/v1/chat/completions":
                 self._handle_chat(body)
             elif self.path == "/v1/responses":
@@ -147,6 +152,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        log_ctx = {"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log(log_ctx, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
@@ -157,7 +165,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream and (not tools or tool_choice == "none"):
             try:
                 self._start_sse()
-                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, _upload_images(images), extra_fields, log_ctx):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -172,7 +180,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields, log_ctx)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -258,12 +266,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        log_ctx = {"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log(log_ctx, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields)
+            text = generate(prompt, model_id, think_mode, _upload_images(images), extra_fields, log_ctx)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -326,6 +337,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
         prompt, images = google_contents_to_prompt(req)
+        log_ctx = {"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log(log_ctx, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
@@ -337,7 +351,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields, log_ctx):
                     if not delta:
                         continue
                     full_text += delta
@@ -363,7 +377,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra_fields, log_ctx)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

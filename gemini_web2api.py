@@ -56,6 +56,12 @@ DEFAULT_CONFIG = {
     "xsrf_token": None,
     "default_model": "gemini-3.5-flash",
     "log_requests": True,
+    "debug_log_client_body": False,
+    "debug_log_prompt": False,
+    "debug_log_google_request": False,
+    "debug_log_google_response": False,
+    "debug_log_dir": "./logs",
+    "debug_redact_auth": True,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
@@ -102,6 +108,34 @@ def log(msg: str):
         sys.stderr.flush()
 
 
+def write_debug_log(ctx: dict, **kwargs):
+    if not ctx:
+        return
+    if not any(CONFIG.get(k) for k in [
+        "debug_log_client_body", "debug_log_prompt",
+        "debug_log_google_request", "debug_log_google_response"
+    ]):
+        return
+    log_dir = CONFIG.get("debug_log_dir", "./logs")
+    if not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except:
+            pass
+    try:
+        entry = {
+            "timestamp": time.time(),
+            "request_id": ctx.get("req_id", "unknown"),
+            "path": ctx.get("path", "unknown"),
+            "model": ctx.get("model", "unknown"),
+        }
+        entry.update(kwargs)
+        with open(os.path.join(log_dir, "debug.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except:
+        pass
+
+
 def load_cookie() -> tuple:
     """Load cookie from file. Returns (cookie_str, sapisid)."""
     cookie_file = CONFIG.get("cookie_file")
@@ -140,12 +174,134 @@ def account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
+_PAGE_TOKENS_CACHE = {"tokens": {}, "ts": 0}
+
+def get_page_tokens() -> dict:
+    """Fetch and cache upload tokens (push_id, pctx) from Gemini web UI."""
+    global _PAGE_TOKENS_CACHE
+    now = time.time()
+    if _PAGE_TOKENS_CACHE["tokens"] and (now - _PAGE_TOKENS_CACHE["ts"]) < 600:
+        return _PAGE_TOKENS_CACHE["tokens"]
+    
+    url = f"https://gemini.google.com{account_prefix()}/app"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    cookie_str, _ = load_cookie()
+    if cookie_str:
+        headers["Cookie"] = cookie_str
+        
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    ctx = ssl.create_default_context()
+    proxy = CONFIG.get("proxy")
+    
+    try:
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+            
+        html = resp.read().decode("utf-8", errors="ignore")
+        tokens = {}
+        m = re.search(r'"qKIAYe":"([^"]+)"', html)
+        if m: tokens["push_id"] = m.group(1)
+        m = re.search(r'"Ylro7b":"([^"]+)"', html)
+        if m: tokens["pctx"] = m.group(1)
+        m = re.search(r'"SNlM0e":"([^"]+)"', html)
+        if m: tokens["at"] = m.group(1)
+        
+        if tokens:
+            _PAGE_TOKENS_CACHE["tokens"] = tokens
+            _PAGE_TOKENS_CACHE["ts"] = now
+            return tokens
+    except Exception as e:
+        log(f"Failed to fetch page tokens: {e}")
+        
+    return {}
+
+
+def upload_text_file(text: str, filename: str = "message.txt") -> str:
+    """Uploads large text as a file to Google's resumable upload endpoint."""
+    bytes_data = text.encode("utf-8")
+    tokens = get_page_tokens()
+    push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
+    pctx = tokens.get("pctx", "CgcSBWjK7pYx")
+    mime = "text/plain; charset=utf-8"
+    
+    start_headers = {
+        "Push-ID": push_id,
+        "X-Tenant-Id": "bard-storage",
+        "X-Client-Pctx": pctx,
+        "X-Goog-Upload-Header-Content-Length": str(len(bytes_data)),
+        "X-Goog-Upload-Header-Content-Type": mime,
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    cookie_str, sapisid = load_cookie()
+    if cookie_str:
+        start_headers["Cookie"] = cookie_str
+    if sapisid:
+        start_headers["Authorization"] = make_sapisidhash(sapisid)
+        
+    start_url = "https://content-push.googleapis.com/upload/"
+    req1 = urllib.request.Request(start_url, data=b"", headers=start_headers, method="POST")
+    ctx = ssl.create_default_context()
+    proxy = CONFIG.get("proxy")
+    
+    opener = None
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+            urllib.request.HTTPSHandler(context=ctx)
+        )
+        
+    if opener:
+        r1 = opener.open(req1, timeout=30)
+    else:
+        r1 = urllib.request.urlopen(req1, context=ctx, timeout=30)
+        
+    upload_url = r1.headers.get("x-goog-upload-url")
+    if not upload_url:
+        raise Exception(f"No upload URL in response: {r1.headers}")
+        
+    upload_headers = {
+        "X-Goog-Upload-Command": "upload, finalize",
+        "X-Goog-Upload-Offset": "0",
+        "Content-Type": "application/octet-stream",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    }
+    req2 = urllib.request.Request(upload_url, data=bytes_data, headers=upload_headers, method="POST")
+    
+    if opener:
+        r2 = opener.open(req2, timeout=60)
+    else:
+        r2 = urllib.request.urlopen(req2, context=ctx, timeout=60)
+        
+    file_ref = r2.read().decode("utf-8").strip()
+    if not file_ref.startswith("/"):
+        raise Exception(f"Invalid file ref: {file_ref[:120]}")
+    return file_ref
+
+
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
 
-def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
+def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, log_ctx: dict = None, file_refs: list = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
     inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    if file_refs:
+        files = []
+        for item in file_refs:
+            files.append([[item["ref"], 1], item["name"]])
+        inner[0] = [prompt, 0, None, files, None, None, 0]
+    else:
+        inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -191,6 +347,22 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
 
+    if CONFIG.get("debug_log_google_request") and log_ctx:
+        log_headers = dict(headers)
+        if CONFIG.get("debug_redact_auth", True):
+            if "Cookie" in log_headers:
+                log_headers["Cookie"] = "[REDACTED]"
+            if "Authorization" in log_headers:
+                log_headers["Authorization"] = "[REDACTED]"
+        
+        write_debug_log(log_ctx, 
+            google_url=url,
+            google_headers_redacted=log_headers,
+            google_body_form=body.decode("utf-8", errors="replace"),
+            google_f_req_decoded=outer,
+            google_inner=inner
+        )
+
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
@@ -205,7 +377,10 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
                 resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            return resp.read().decode("utf-8", errors="replace")
+            resp_text = resp.read().decode("utf-8", errors="replace")
+            if CONFIG.get("debug_log_google_response") and log_ctx:
+                write_debug_log(log_ctx, response_raw=resp_text)
+            return resp_text
         except Exception as e:
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
@@ -214,10 +389,16 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int) -> str:
     raise last_err
 
 
-def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
+def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, log_ctx: dict = None, file_refs: list = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
     inner = [None] * 80
-    inner[0] = [prompt, 0, None, None, None, None, 0]
+    if file_refs:
+        files = []
+        for item in file_refs:
+            files.append([[item["ref"], 1], item["name"]])
+        inner[0] = [prompt, 0, None, files, None, None, 0]
+    else:
+        inner[0] = [prompt, 0, None, None, None, None, 0]
     inner[1] = ["en"]
     inner[2] = ["", "", "", None, None, None, None, None, None, ""]
     inner[6] = [0]
@@ -262,11 +443,27 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
 
+    if CONFIG.get("debug_log_google_request") and log_ctx:
+        log_headers = dict(headers)
+        if CONFIG.get("debug_redact_auth", True):
+            if "Cookie" in log_headers:
+                log_headers["Cookie"] = "[REDACTED]"
+            if "Authorization" in log_headers:
+                log_headers["Authorization"] = "[REDACTED]"
+        
+        write_debug_log(log_ctx, 
+            google_url=url,
+            google_headers_redacted=log_headers,
+            google_body_form=body if isinstance(body, str) else body.decode("utf-8", errors="replace"),
+            google_f_req_decoded=outer,
+            google_inner=inner
+        )
+
     proxy = CONFIG.get("proxy")
 
     if not HAS_HTTPX:
         # Fallback: non-streaming with urllib
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
+        raw = gemini_stream_generate(prompt, model_id, think_mode, log_ctx)
         text = extract_response_text(raw)
         if text:
             yield text
@@ -277,7 +474,10 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
     with httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True) as client:
         with client.stream("POST", url, content=body, headers=headers) as resp:
             buf = ""
+            raw_acc = ""
             for chunk in resp.iter_text():
+                if CONFIG.get("debug_log_google_response") and log_ctx:
+                    raw_acc += chunk
                 buf += chunk
                 if "BardErrorInfo" in buf:
                     import re as _re
@@ -306,6 +506,8 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int):
                                             prev_text = t
                     except (json.JSONDecodeError, IndexError, TypeError):
                         pass
+            if CONFIG.get("debug_log_google_response") and log_ctx:
+                write_debug_log(log_ctx, response_raw=raw_acc)
 
 
 def clean_gemini_text(text: str) -> str:
@@ -482,6 +684,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(length) if length else b""
+            
+            self.req_id = f"req_{uuid.uuid4().hex[:8]}"
+            if CONFIG.get("debug_log_client_body"):
+                write_debug_log({"req_id": self.req_id, "path": self.path}, client_body_raw=body.decode("utf-8", errors="replace"))
+
             if self.path == "/v1/chat/completions":
                 self.handle_chat(body)
             elif self.path == "/v1/responses":
@@ -511,8 +718,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return None, None, None, f"Unknown model: {model_name}"
         return model_name, cfg["mode"], (think_override if think_override is not None else cfg["think"]), None
 
-    def _call_gemini(self, prompt, model_id, think_mode, tools):
-        raw = gemini_stream_generate(prompt, model_id, think_mode)
+    def _call_gemini(self, prompt, model_id, think_mode, tools, model_name=None, file_refs=None):
+        log_ctx = getattr(self, "req_id", None) and {"req_id": self.req_id, "path": getattr(self, "path", ""), "model": model_name} or None
+        raw = gemini_stream_generate(prompt, model_id, think_mode, log_ctx, file_refs=file_refs)
         text = extract_response_text(raw)
         tool_calls = None
         if tools and text:
@@ -529,9 +737,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         prompt = messages_to_prompt(req.get("messages", []), tools)
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log({"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
+
+        file_refs = None
+        if len(prompt.encode("utf-8")) > 90000:
+            cookie_str, _ = load_cookie()
+            if not cookie_str:
+                self.send_json({"error": {"message": "Prompt is too large (>90000 bytes) and requires a GEMINI_COOKIE to upload as a file."}}, 400)
+                return
+            try:
+                log(f"Prompt length {len(prompt.encode('utf-8'))} > 90000 bytes. Uploading as message.txt...")
+                ref = upload_text_file(prompt, "message.txt")
+                file_refs = [{"ref": ref, "name": "message.txt"}]
+                prompt = "Context is attached in `message.txt`. Acknowledge it briefly, then treat it as the primary user input for this turn and answer based on it."
+            except Exception as e:
+                self.send_json({"error": {"message": f"Failed to upload large prompt as text file: {e}"}}, 502)
+                return
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -544,7 +769,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode):
+                log_ctx = getattr(self, "req_id", None) and {"req_id": self.req_id, "path": getattr(self, "path", ""), "model": model_name} or None
+                for delta_text in gemini_stream_generate_iter(prompt, model_id, think_mode, log_ctx, file_refs=file_refs):
                     chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
                              "model": model_name, "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}]}
                     self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
@@ -563,7 +789,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         # Non-streaming (or tool calling which needs full response)
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, model_name=model_name, file_refs=file_refs)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -647,12 +873,29 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
         prompt = messages_to_prompt(messages, tools)
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log({"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        file_refs = None
+        if len(prompt.encode("utf-8")) > 90000:
+            cookie_str, _ = load_cookie()
+            if not cookie_str:
+                self.send_json({"error": {"message": "Prompt is too large (>90000 bytes) and requires a GEMINI_COOKIE to upload as a file."}}, 400)
+                return
+            try:
+                log(f"Prompt length {len(prompt.encode('utf-8'))} > 90000 bytes. Uploading as message.txt...")
+                ref = upload_text_file(prompt, "message.txt")
+                file_refs = [{"ref": ref, "name": "message.txt"}]
+                prompt = "Context is attached in `message.txt`. Acknowledge it briefly, then treat it as the primary user input for this turn and answer based on it."
+            except Exception as e:
+                self.send_json({"error": {"message": f"Failed to upload large prompt as text file: {e}"}}, 502)
+                return
+
         try:
-            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools)
+            text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, model_name=model_name, file_refs=file_refs)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
@@ -752,12 +995,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         prompt = self._google_contents_to_prompt(req)
+        if CONFIG.get("debug_log_prompt"):
+            write_debug_log({"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}, prompt=prompt)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
         try:
-            text, _ = self._call_gemini(prompt, model_id, think_mode, None)
+            text, _ = self._call_gemini(prompt, model_id, think_mode, None, model_name=model_name)
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return

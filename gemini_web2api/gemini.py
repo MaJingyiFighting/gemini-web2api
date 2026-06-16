@@ -28,6 +28,33 @@ def log(msg: str):
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
 
+def write_debug_log(ctx: dict, **kwargs):
+    if not ctx:
+        return
+    if not any(CONFIG.get(k) for k in [
+        "debug_log_client_body", "debug_log_prompt",
+        "debug_log_google_request", "debug_log_google_response"
+    ]):
+        return
+    log_dir = CONFIG.get("debug_log_dir", "./logs")
+    if not os.path.exists(log_dir):
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except:
+            pass
+    try:
+        entry = {
+            "timestamp": time.time(),
+            "request_id": ctx.get("req_id", "unknown"),
+            "path": ctx.get("path", "unknown"),
+            "model": ctx.get("model", "unknown"),
+        }
+        entry.update(kwargs)
+        with open(os.path.join(log_dir, "debug.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except:
+        pass
+
 
 def _get_ssl_ctx():
     global _ssl_ctx
@@ -130,8 +157,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
-    outer = [None, json.dumps(inner)]
-    params = {"f.req": json.dumps(outer)}
+    outer = [None, json.dumps(inner, ensure_ascii=False)]
+    params = {"f.req": json.dumps(outer, ensure_ascii=False)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
     return urllib.parse.urlencode(params)
@@ -181,6 +208,10 @@ def _extract_texts_from_line(line: str) -> list:
 
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text."""
+    bard_err = re.search(r'BardErrorInfo".*?\[(\d+)\]', raw)
+    if bard_err:
+        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    
     last_text = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
@@ -189,13 +220,25 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, log_ctx: dict = None) -> str:
     """Non-streaming generation with retry."""
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
+    body_str = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+    body = body_str.encode()
     url = _get_url()
     headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
+
+    if CONFIG.get("debug_log_google_request") and log_ctx:
+        log_headers = dict(headers)
+        if CONFIG.get("debug_redact_auth", True):
+            if "Cookie" in log_headers:
+                log_headers["Cookie"] = "[REDACTED]"
+            if "Authorization" in log_headers:
+                log_headers["Authorization"] = "[REDACTED]"
+        write_debug_log(log_ctx, 
+            google_url=url, google_headers_redacted=log_headers, google_body_form=urllib.parse.unquote(body_str)
+        )
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
@@ -210,6 +253,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            if CONFIG.get("debug_log_google_response") and log_ctx:
+                write_debug_log(log_ctx, response_raw=raw)
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
@@ -219,27 +264,44 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, log_ctx: dict = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, log_ctx)
         if text:
             yield text
         return
 
-    body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
+    body_str = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
     headers = _build_headers()
     client = _get_httpx_client()
+
+    if CONFIG.get("debug_log_google_request") and log_ctx:
+        log_headers = dict(headers)
+        if CONFIG.get("debug_redact_auth", True):
+            if "Cookie" in log_headers:
+                log_headers["Cookie"] = "[REDACTED]"
+            if "Authorization" in log_headers:
+                log_headers["Authorization"] = "[REDACTED]"
+        write_debug_log(log_ctx, 
+            google_url=url, google_headers_redacted=log_headers, google_body_form=urllib.parse.unquote(body_str)
+        )
 
     last_err = None
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             prev_text = ""
-            with client.stream("POST", url, content=body, headers=headers) as resp:
+            with client.stream("POST", url, content=body_str, headers=headers) as resp:
                 buf = ""
+                raw_acc = ""
                 for chunk in resp.iter_text():
+                    if CONFIG.get("debug_log_google_response") and log_ctx:
+                        raw_acc += chunk
                     buf += chunk
+                    bard_err = re.search(r'BardErrorInfo".*?\[(\d+)\]', buf)
+                    if bard_err:
+                        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         for t in _extract_texts_from_line(line):
@@ -248,6 +310,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 if delta:
                                     yield delta
                                 prev_text = t
+                if CONFIG.get("debug_log_google_response") and log_ctx:
+                    write_debug_log(log_ctx, response_raw=raw_acc)
             return
         except Exception as e:
             last_err = e
