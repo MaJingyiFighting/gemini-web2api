@@ -137,7 +137,14 @@ def write_debug_log(ctx: dict, **kwargs):
 
 
 def load_cookie() -> tuple:
-    """Load cookie from file. Returns (cookie_str, sapisid)."""
+    """Load cookie from env or file. Returns (cookie_str, sapisid)."""
+    env_cookie = os.environ.get("GEMINI_COOKIE")
+    if env_cookie:
+        cookie_str = env_cookie
+        pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
+        sapisid = pairs.get("SAPISID", "")
+        return cookie_str, sapisid if sapisid else None
+
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file:
         return "", None
@@ -225,13 +232,11 @@ def get_page_tokens() -> dict:
     return {}
 
 
-def upload_text_file(text: str, filename: str = "message.txt") -> str:
-    """Uploads large text as a file to Google's resumable upload endpoint."""
-    bytes_data = text.encode("utf-8")
+def upload_file(bytes_data: bytes, mime: str, filename: str) -> str:
+    """Uploads bytes as a file to Google's resumable upload endpoint."""
     tokens = get_page_tokens()
     push_id = tokens.get("push_id", "feeds/mcudyrk2a4khkz")
     pctx = tokens.get("pctx", "CgcSBWjK7pYx")
-    mime = "text/plain; charset=utf-8"
     
     start_headers = {
         "Push-ID": push_id,
@@ -288,6 +293,48 @@ def upload_text_file(text: str, filename: str = "message.txt") -> str:
     if not file_ref.startswith("/"):
         raise Exception(f"Invalid file ref: {file_ref[:120]}")
     return file_ref
+
+
+def upload_text_file(text: str, filename: str = "message.txt") -> str:
+    """Uploads large text as a file to Google's resumable upload endpoint."""
+    return upload_file(text.encode("utf-8"), "text/plain; charset=utf-8", filename)
+
+def resolve_images(images: list) -> list:
+    """Uploads images and returns a list of file references."""
+    if not images:
+        return []
+    cookie_str, _ = load_cookie()
+    if not cookie_str:
+        log("No GEMINI_COOKIE configured, skipping image upload.")
+        return []
+        
+    refs = []
+    for idx, img in enumerate(images):
+        try:
+            url = img.get("url", "")
+            if url.startswith("data:"):
+                header, data = url.split(",", 1)
+                mime = header.split(":")[1].split(";")[0]
+                if not mime: mime = "image/png"
+                bytes_data = base64.b64decode(data)
+                name = f"image_{idx}.png"
+            elif url.startswith("http"):
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    bytes_data = resp.read()
+                    mime = resp.headers.get("Content-Type", "image/jpeg")
+                    name = url.split("/")[-1].split("?")[0]
+                    if not name: name = f"image_{idx}.jpg"
+            else:
+                continue
+                
+            ref = upload_file(bytes_data, mime, name)
+            refs.append({"ref": ref, "name": name})
+            log(f"Image upload succeeded: {name}")
+        except Exception as e:
+            log(f"Image upload failed: {e}")
+            
+    return refs
 
 
 # ─── Gemini Protocol ─────────────────────────────────────────────────────────
@@ -554,9 +601,10 @@ def extract_response_text(raw: str) -> str:
 
 # ─── OpenAI Format Helpers ───────────────────────────────────────────────────
 
-def messages_to_prompt(messages: list, tools: list = None) -> str:
-    """Convert OpenAI messages to prompt string."""
+def messages_to_prompt(messages: list, tools: list = None) -> tuple:
+    """Convert OpenAI messages to prompt string and extract images."""
     parts = []
+    images = []
     if tools:
         tool_defs = []
         for tool in tools:
@@ -578,10 +626,13 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if isinstance(content, list):
-            content = " ".join(
-                c.get("text", "") for c in content
-                if c.get("type") in ("text", "input_text")
-            )
+            text_parts = []
+            for c in content:
+                if c.get("type") in ("text", "input_text"):
+                    text_parts.append(c.get("text", ""))
+                elif c.get("type") == "image_url":
+                    images.append(c.get("image_url", {}))
+            content = " ".join(text_parts)
         if role == "system":
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
@@ -600,7 +651,7 @@ def messages_to_prompt(messages: list, tools: list = None) -> str:
             parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
         else:
             parts.append(content if content else "")
-    return "\n\n".join(p for p in parts if p)
+    return "\n\n".join(p for p in parts if p), images
 
 
 def parse_tool_calls(text: str) -> tuple:
@@ -736,14 +787,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         tools = req.get("tools")
-        prompt = messages_to_prompt(req.get("messages", []), tools)
+        prompt, images = messages_to_prompt(req.get("messages", []), tools)
         if CONFIG.get("debug_log_prompt"):
             write_debug_log({"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}, prompt=prompt)
-        if not prompt.strip():
+        if not prompt.strip() and not images:
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
-        file_refs = None
+        file_refs = resolve_images(images) if images else []
         if len(prompt.encode("utf-8")) > 90000:
             cookie_str, _ = load_cookie()
             if not cookie_str:
@@ -752,11 +803,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 log(f"Prompt length {len(prompt.encode('utf-8'))} > 90000 bytes. Uploading as message.txt...")
                 ref = upload_text_file(prompt, "message.txt")
-                file_refs = [{"ref": ref, "name": "message.txt"}]
+                file_refs.append({"ref": ref, "name": "message.txt"})
                 prompt = "Context is attached in `message.txt`. Acknowledge it briefly, then treat it as the primary user input for this turn and answer based on it."
             except Exception as e:
                 self.send_json({"error": {"message": f"Failed to upload large prompt as text file: {e}"}}, 502)
                 return
+        
+        if not file_refs:
+            file_refs = None
 
         stream = req.get("stream", False)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -865,21 +919,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         role = item.get("role", "user")
                         content = item.get("content", "")
                         if isinstance(content, list):
-                            content = " ".join(c.get("text", "") for c in content if c.get("type") in ("text", "input_text"))
+                            text_parts = []
+                            for c in content:
+                                if c.get("type") in ("text", "input_text"):
+                                    text_parts.append(c.get("text", ""))
+                                elif c.get("type") == "image_url":
+                                    images.append(c.get("image_url", {}))
+                            content = " ".join(text_parts)
                         messages.append({"role": role, "content": content})
 
         if tools:
             tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
-        prompt = messages_to_prompt(messages, tools)
+        prompt, images = messages_to_prompt(messages, tools)
         if CONFIG.get("debug_log_prompt"):
             write_debug_log({"req_id": getattr(self, "req_id", "unknown"), "path": getattr(self, "path", ""), "model": model_name}, prompt=prompt)
-        if not prompt.strip():
+        if not prompt.strip() and not images:
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
-        file_refs = None
+        file_refs = resolve_images(images) if images else []
         if len(prompt.encode("utf-8")) > 90000:
             cookie_str, _ = load_cookie()
             if not cookie_str:
@@ -888,11 +948,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             try:
                 log(f"Prompt length {len(prompt.encode('utf-8'))} > 90000 bytes. Uploading as message.txt...")
                 ref = upload_text_file(prompt, "message.txt")
-                file_refs = [{"ref": ref, "name": "message.txt"}]
+                file_refs.append({"ref": ref, "name": "message.txt"})
                 prompt = "Context is attached in `message.txt`. Acknowledge it briefly, then treat it as the primary user input for this turn and answer based on it."
             except Exception as e:
                 self.send_json({"error": {"message": f"Failed to upload large prompt as text file: {e}"}}, 502)
                 return
+
+        if not file_refs:
+            file_refs = None
 
         try:
             text, tool_calls = self._call_gemini(prompt, model_id, think_mode, tools, model_name=model_name, file_refs=file_refs)
